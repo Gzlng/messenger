@@ -11,11 +11,20 @@ class P2PMessenger:
     def __init__(self):
         self.username = self.get_local_ip()
         self.peers = {}  # {ip: {"socket": socket, "last_seen": timestamp}}
+        
+        # История сообщений
+        self.chat_history = {
+            "group": {
+                "Общий чат": [],
+                "Техподдержка": []
+            },
+            "private": {}  # {ip: [messages]}
+        }
+        
         self.group_chats = {
             "Общий чат": set(),
             "Техподдержка": set()
         }
-        self.private_chats = {}  # {target_ip: [messages]}
         self.current_chat = "Общий чат"
         self.chat_type = "group"  # "group" или "private"
         
@@ -151,8 +160,6 @@ class P2PMessenger:
             self.handle_presence(sender_ip, message)
         elif msg_type == 'message':
             self.handle_chat_message(sender_ip, message)
-        elif msg_type == 'typing':
-            self.handle_typing(sender_ip, message)
     
     def handle_presence(self, sender_ip, message):
         """Обработка сообщения о присутствии"""
@@ -161,6 +168,10 @@ class P2PMessenger:
                 "last_seen": time.time(),
                 "username": sender_ip
             }
+            
+            # Инициализируем историю приватного чата если ее нет
+            if sender_ip not in self.chat_history["private"]:
+                self.chat_history["private"][sender_ip] = []
             
             # Добавляем в список пользователей если его нет
             self.root.after(0, self.update_users_list)
@@ -174,16 +185,38 @@ class P2PMessenger:
         content = message.get('content')
         timestamp = message.get('timestamp')
         
+        # Сохраняем сообщение в историю
+        self.save_message(sender_ip, content, timestamp, chat_type, message.get('group_name', ''))
+        
+        # Отображаем сообщение если открыт соответствующий чат
         if chat_type == 'group':
             group_name = message.get('group_name')
-            self.display_message(sender_ip, content, timestamp, 'group', group_name)
+            if self.chat_type == 'group' and self.current_chat == group_name:
+                self.display_message(sender_ip, content, timestamp, 'group', group_name)
         elif chat_type == 'private':
-            self.display_message(sender_ip, content, timestamp, 'private', sender_ip)
+            if (self.chat_type == 'private' and self.current_chat == sender_ip) or \
+               (self.chat_type == 'private' and self.current_chat == message.get('target')):
+                self.display_message(sender_ip, content, timestamp, 'private', sender_ip)
     
-    def handle_typing(self, sender_ip, message):
-        """Обработка индикатора набора текста"""
-        # Можно добавить отображение "пользователь печатает"
-        pass
+    def save_message(self, sender, content, timestamp, chat_type, group_name=""):
+        """Сохранение сообщения в историю"""
+        if chat_type == 'group':
+            if group_name in self.chat_history["group"]:
+                self.chat_history["group"][group_name].append({
+                    'sender': sender,
+                    'content': content,
+                    'timestamp': timestamp,
+                    'type': 'group'
+                })
+        elif chat_type == 'private':
+            target_ip = sender
+            if target_ip in self.chat_history["private"]:
+                self.chat_history["private"][target_ip].append({
+                    'sender': sender,
+                    'content': content,
+                    'timestamp': timestamp,
+                    'type': 'private'
+                })
     
     def broadcast_presence_loop(self):
         """Цикл широковещательного оповещения"""
@@ -223,7 +256,8 @@ class P2PMessenger:
         elif self.chat_type == 'private':
             self.send_private_message(content, self.current_chat, timestamp)
         
-        # Отображаем свое сообщение
+        # Сохраняем и отображаем свое сообщение
+        self.save_message(self.username, content, timestamp, self.chat_type, self.current_chat)
         self.display_message(self.username, content, timestamp, self.chat_type, self.current_chat)
     
     def send_group_message(self, content, group_name, timestamp):
@@ -293,6 +327,30 @@ class P2PMessenger:
             self.chat_area.config(state=tk.DISABLED)
             self.chat_area.see(tk.END)
     
+    def load_chat_history(self):
+        """Загрузка истории текущего чата"""
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.delete(1.0, tk.END)
+        
+        if self.chat_type == 'group':
+            if self.current_chat in self.chat_history["group"]:
+                for msg in self.chat_history["group"][self.current_chat]:
+                    sender = "Вы" if msg['sender'] == self.username else msg['sender']
+                    display_text = f"[{msg['timestamp']}] {sender}: {msg['content']}\n"
+                    tag = "own_message" if msg['sender'] == self.username else "other_message"
+                    self.chat_area.insert(tk.END, display_text, tag)
+        
+        elif self.chat_type == 'private':
+            if self.current_chat in self.chat_history["private"]:
+                for msg in self.chat_history["private"][self.current_chat]:
+                    sender = "Вы" if msg['sender'] == self.username else msg['sender']
+                    display_text = f"[{msg['timestamp']}] {sender}: {msg['content']}\n"
+                    tag = "own_message" if msg['sender'] == self.username else "other_message"
+                    self.chat_area.insert(tk.END, display_text, tag)
+        
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.see(tk.END)
+    
     def on_group_select(self, event):
         """Обработка выбора группового чата"""
         selection = self.group_listbox.curselection()
@@ -301,7 +359,7 @@ class P2PMessenger:
             self.current_chat = group_name
             self.chat_type = "group"
             self.chat_header.config(text=f"Групповой чат: {group_name}")
-            self.clear_chat_area()
+            self.load_chat_history()
             self.update_status(f"Выбран чат: {group_name}")
     
     def on_user_select(self, event):
@@ -313,18 +371,13 @@ class P2PMessenger:
                 self.current_chat = user_ip
                 self.chat_type = "private"
                 self.chat_header.config(text=f"Приватный чат с {user_ip}")
-                self.clear_chat_area()
-                self.update_status(f"Чат с {user_ip}")
                 
                 # Инициализируем историю чата если ее нет
-                if user_ip not in self.private_chats:
-                    self.private_chats[user_ip] = []
-    
-    def clear_chat_area(self):
-        """Очистка области чата"""
-        self.chat_area.config(state=tk.NORMAL)
-        self.chat_area.delete(1.0, tk.END)
-        self.chat_area.config(state=tk.DISABLED)
+                if user_ip not in self.chat_history["private"]:
+                    self.chat_history["private"][user_ip] = []
+                
+                self.load_chat_history()
+                self.update_status(f"Чат с {user_ip}")
     
     def update_users_list(self):
         """Обновление списка пользователей"""
@@ -347,6 +400,7 @@ class P2PMessenger:
         # Удаляем устаревших пользователей
         for ip in expired_peers:
             del self.peers[ip]
+            # Не удаляем историю чата при отключении пользователя
         
         self.update_status(f"Найдено пользователей: {len(self.peers)}")
     
