@@ -1,460 +1,383 @@
-# messenger.py
-import tkinter as tk
-from tkinter import ttk, scrolledtext
 import socket
 import threading
-import json
 import time
+import json
 from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import sys
 
-class P2PMessenger:
-    def __init__(self):
-        self.username = self.get_local_ip()
-        self.peers = {}  # {ip: {"socket": socket, "connected": bool}}
-        self.connections = []  # Активные TCP соединения
+class P2PChatGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("P2P Чат")
+        self.root.geometry("800x600")
         
-        # История сообщений
-        self.chat_history = {
-            "group": {
-                "Общий чат": [],
-                "Техподдержка": []
-            },
-            "private": {}
-        }
+        self.username = socket.gethostbyname(socket.gethostname())
+        self.running = True
         
-        self.current_chat = "Общий чат"
-        self.chat_type = "group"
+        # Настройки для группового чата (multicast)
+        self.multicast_group = '224.1.1.1'
+        self.multicast_port = 5007
+        self.multicast_ttl = 1
+        self.tcp_port = 5008
+        self.known_users = {}
         
-        # Сетевые настройки
-        self.port = 8888
-        self.broadcast_port = 8889
+        self.setup_sockets()
+        self.create_widgets()
+        self.start_listeners()
         
-        self.setup_gui()
-        self.start_network()
+        # Уведомляем о своем присутствии
+        self.broadcast_online()
         
-    def get_local_ip(self):
-        """Получение локального IP-адреса"""
+    def setup_sockets(self):
+        """Инициализация сокетов"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return "127.0.0.1"
-    
-    def setup_gui(self):
-        """Настройка графического интерфейса"""
-        self.root = tk.Tk()
-        self.root.title(f"Мессенджер - {self.username}")
-        self.root.geometry("800x500")
-        
+            # Multicast сокет для группового чата
+            self.multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.multicast_ttl)
+            
+            # UDP сокет для приема multicast
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_socket.bind(('', self.multicast_port))
+            
+            # Подписка на multicast группу
+            group = socket.inet_aton(self.multicast_group)
+            mreq = group + socket.inet_aton('0.0.0.0')
+            self.udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            
+            # TCP сокет для личных сообщений
+            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.tcp_socket.bind(('0.0.0.0', self.tcp_port))
+            self.tcp_socket.listen(5)
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось инициализировать сокеты: {e}")
+            sys.exit(1)
+            
+    def create_widgets(self):
+        """Создание элементов интерфейса"""
         # Основной фрейм
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Левая панель
-        left_frame = ttk.Frame(main_frame, width=200)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
-        left_frame.pack_propagate(False)
+        # Настройка весов для растягивания
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
         
         # Информация о пользователе
-        user_frame = ttk.LabelFrame(left_frame, text="Мой профиль")
-        user_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(user_frame, text=f"IP: {self.username}").pack(anchor=tk.W)
+        info_frame = ttk.Frame(main_frame)
+        info_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        # Групповые чаты
-        group_frame = ttk.LabelFrame(left_frame, text="Групповые чаты")
-        group_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(info_frame, text=f"Ваш IP: {self.username}", 
+                 font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
         
-        self.group_listbox = tk.Listbox(group_frame, height=4)
-        self.group_listbox.pack(fill=tk.BOTH, expand=True)
-        for group in self.chat_history["group"]:
-            self.group_listbox.insert(tk.END, group)
-        self.group_listbox.bind('<<ListboxSelect>>', self.on_group_select)
-        self.group_listbox.selection_set(0)  # Выбираем первый чат по умолчанию
+        ttk.Button(info_frame, text="Обновить", 
+                  command=self.broadcast_online).pack(side=tk.RIGHT)
         
-        # Пользователи
-        users_frame = ttk.LabelFrame(left_frame, text="Пользователи")
-        users_frame.pack(fill=tk.BOTH, expand=True)
+        # Фрейм с пользователями и чатом
+        content_frame = ttk.Frame(main_frame)
+        content_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        content_frame.columnconfigure(1, weight=1)
+        content_frame.rowconfigure(0, weight=1)
         
-        self.users_listbox = tk.Listbox(users_frame)
-        self.users_listbox.pack(fill=tk.BOTH, expand=True)
-        self.users_listbox.bind('<<ListboxSelect>>', self.on_user_select)
+        # Список пользователей
+        users_frame = ttk.LabelFrame(content_frame, text="Онлайн пользователи", padding="5", width=200)
+        users_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+        users_frame.columnconfigure(0, weight=1)
+        users_frame.rowconfigure(0, weight=1)
         
-        # Правая панель
-        right_frame = ttk.Frame(main_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.users_listbox = tk.Listbox(users_frame, height=15)
+        self.users_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Заголовок чата
-        self.chat_header = ttk.Label(right_frame, text="Общий чат", 
-                                   font=('Arial', 12, 'bold'))
-        self.chat_header.pack(fill=tk.X, pady=(0, 5))
+        scrollbar_users = ttk.Scrollbar(users_frame, orient=tk.VERTICAL, command=self.users_listbox.yview)
+        scrollbar_users.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.users_listbox.configure(yscrollcommand=scrollbar_users.set)
         
-        # Область сообщений
-        self.chat_area = scrolledtext.ScrolledText(right_frame, wrap=tk.WORD)
-        self.chat_area.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        self.chat_area.config(state=tk.DISABLED)
+        # Кнопки для пользователей
+        users_buttons_frame = ttk.Frame(users_frame)
+        users_buttons_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(5, 0))
         
-        # Панель ввода
-        input_frame = ttk.Frame(right_frame)
-        input_frame.pack(fill=tk.X)
+        ttk.Button(users_buttons_frame, text="Личное сообщение",
+                  command=self.send_private_from_list).pack(side=tk.LEFT, fill=tk.X, expand=True)
         
-        self.message_entry = ttk.Entry(input_frame)
-        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.message_entry.bind('<Return>', self.send_message)
+        # Область чата
+        chat_frame = ttk.LabelFrame(content_frame, text="Чат", padding="5")
+        chat_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        chat_frame.columnconfigure(0, weight=1)
+        chat_frame.rowconfigure(0, weight=1)
         
-        ttk.Button(input_frame, text="Отправить", 
-                  command=self.send_message).pack(side=tk.RIGHT, padx=(5, 0))
+        self.chat_text = scrolledtext.ScrolledText(chat_frame, height=20, width=60, state=tk.DISABLED)
+        self.chat_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Панель управления
-        control_frame = ttk.Frame(left_frame)
-        control_frame.pack(fill=tk.X, pady=5)
+        # Фрейм ввода сообщения
+        input_frame = ttk.Frame(main_frame)
+        input_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        input_frame.columnconfigure(0, weight=1)
         
-        ttk.Button(control_frame, text="Добавить IP", 
-                  command=self.add_ip_dialog).pack(fill=tk.X)
-        ttk.Button(control_frame, text="Обновить", 
-                  command=self.manual_discovery).pack(fill=tk.X, pady=2)
+        # Выбор типа сообщения
+        type_frame = ttk.Frame(input_frame)
+        type_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
-        # Статус
+        self.message_type = tk.StringVar(value="group")
+        ttk.Radiobutton(type_frame, text="Групповое", variable=self.message_type, 
+                       value="group").pack(side=tk.LEFT)
+        ttk.Radiobutton(type_frame, text="Личное", variable=self.message_type, 
+                       value="private").pack(side=tk.LEFT, padx=(20, 0))
+        
+        # Поле ввода и кнопка отправки
+        send_frame = ttk.Frame(input_frame)
+        send_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        send_frame.columnconfigure(0, weight=1)
+        
+        self.message_entry = ttk.Entry(send_frame)
+        self.message_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 10))
+        self.message_entry.bind('<Return>', lambda e: self.send_message())
+        
+        ttk.Button(send_frame, text="Отправить", command=self.send_message).grid(row=0, column=1)
+        
+        # Статус бар
         self.status_var = tk.StringVar(value="Готов к работе")
-        ttk.Label(self.root, textvariable=self.status_var, 
-                 relief=tk.SUNKEN).pack(fill=tk.X, side=tk.BOTTOM)
-    
-    def add_ip_dialog(self):
-        """Диалог для ручного добавления IP"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Добавить пользователя")
-        dialog.geometry("300x100")
-        dialog.transient(self.root)
-        dialog.grab_set()
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
         
-        ttk.Label(dialog, text="Введите IP-адрес:").pack(pady=5)
-        ip_entry = ttk.Entry(dialog, width=20)
-        ip_entry.pack(pady=5)
-        ip_entry.focus()
+        # Обновление списка пользователей
+        self.update_users_list()
         
-        def add_ip():
-            ip = ip_entry.get().strip()
-            if ip and ip != self.username:
-                self.connect_to_peer(ip)
-            dialog.destroy()
-        
-        ttk.Button(dialog, text="Добавить", command=add_ip).pack(pady=5)
-        ip_entry.bind('<Return>', lambda e: add_ip())
-    
-    def start_network(self):
-        """Запуск сетевых функций"""
-        # Запуск TCP сервера для входящих соединений
-        self.server_thread = threading.Thread(target=self.start_server, daemon=True)
-        self.server_thread.start()
-        
-        # Запуск обнаружения в сети
-        self.discovery_thread = threading.Thread(target=self.network_discovery, daemon=True)
-        self.discovery_thread.start()
-        
-        self.update_status("Сервер запущен. Ищу пользователей...")
-    
-    def start_server(self):
-        """Запуск TCP сервера"""
-        try:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(('0.0.0.0', self.port))
-            server_socket.listen(5)
-            
-            while True:
-                client_socket, addr = server_socket.accept()
-                ip = addr[0]
-                
-                if ip != self.username:
-                    self.peers[ip] = {"socket": client_socket, "connected": True}
-                    self.connections.append(client_socket)
-                    
-                    # Запускаем обработчик сообщений для этого клиента
-                    client_thread = threading.Thread(
-                        target=self.handle_client, 
-                        args=(client_socket, ip),
-                        daemon=True
-                    )
-                    client_thread.start()
-                    
-                    self.root.after(0, self.update_users_list)
-                    self.update_status(f"Подключен: {ip}")
-                    
-        except Exception as e:
-            self.update_status(f"Ошибка сервера: {e}")
-    
-    def handle_client(self, client_socket, ip):
-        """Обработка сообщений от клиента"""
-        try:
-            while True:
-                data = client_socket.recv(1024).decode('utf-8')
-                if not data:
-                    break
-                    
-                try:
-                    message = json.loads(data)
-                    self.process_message(message, ip)
-                except json.JSONDecodeError:
-                    continue
-                    
-        except Exception as e:
-            print(f"Ошибка с клиентом {ip}: {e}")
-        finally:
-            client_socket.close()
-            if ip in self.peers:
-                self.peers[ip]["connected"] = False
-            self.root.after(0, self.update_users_list)
-    
-    def process_message(self, message, sender_ip):
-        """Обработка входящего сообщения"""
-        msg_type = message.get('type')
-        
-        if msg_type == 'discovery':
-            # Ответ на обнаружение - устанавливаем соединение
-            self.connect_to_peer(sender_ip)
-            
-        elif msg_type == 'message':
-            content = message.get('content', '')
-            timestamp = message.get('timestamp', '')
-            chat_type = message.get('chat_type', 'group')
-            target = message.get('target', '')
-            
-            # Сохраняем сообщение
-            self.save_message(sender_ip, content, timestamp, chat_type, target)
-            
-            # Отображаем если открыт соответствующий чат
-            if chat_type == 'group':
-                if self.chat_type == 'group' and self.current_chat == target:
-                    self.display_message(sender_ip, content, timestamp)
-            elif chat_type == 'private':
-                if (self.chat_type == 'private' and self.current_chat == sender_ip):
-                    self.display_message(sender_ip, content, timestamp)
-    
-    def save_message(self, sender, content, timestamp, chat_type, target=""):
-        """Сохранение сообщения в историю"""
-        if chat_type == 'group':
-            if target in self.chat_history["group"]:
-                self.chat_history["group"][target].append({
-                    'sender': sender,
-                    'content': content,
-                    'timestamp': timestamp,
-                    'type': 'group'
-                })
-        elif chat_type == 'private':
-            if sender not in self.chat_history["private"]:
-                self.chat_history["private"][sender] = []
-            self.chat_history["private"][sender].append({
-                'sender': sender,
-                'content': content,
-                'timestamp': timestamp,
-                'type': 'private'
-            })
-    
-    def network_discovery(self):
-        """Обнаружение пользователей в сети"""
-        time.sleep(1)  # Даем время серверу запуститься
-        
-        # Сканируем локальную сеть
-        base_ip = '.'.join(self.username.split('.')[:-1]) + '.'
-        
-        for i in range(1, 255):
-            ip = base_ip + str(i)
-            if ip != self.username:
-                self.connect_to_peer(ip)
-    
-    def connect_to_peer(self, ip):
-        """Подключение к другому пользователю"""
-        if ip in self.peers and self.peers[ip].get("connected"):
-            return
-            
-        try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(2)
-            client_socket.connect((ip, self.port))
-            
-            self.peers[ip] = {"socket": client_socket, "connected": True}
-            self.connections.append(client_socket)
-            
-            # Запускаем обработчик
-            client_thread = threading.Thread(
-                target=self.handle_client, 
-                args=(client_socket, ip),
-                daemon=True
-            )
-            client_thread.start()
-            
-            # Отправляем сообщение обнаружения
-            discovery_msg = {
-                'type': 'discovery',
-                'sender': self.username
-            }
-            self.send_to_peer(ip, discovery_msg)
-            
-            self.root.after(0, self.update_users_list)
-            self.update_status(f"Подключен к: {ip}")
-            
-        except:
-            pass  # Пользователь недоступен - это нормально
-    
-    def send_to_peer(self, ip, message):
-        """Отправка сообщения конкретному пользователю"""
-        try:
-            if ip in self.peers and self.peers[ip]["connected"]:
-                data = json.dumps(message).encode('utf-8')
-                self.peers[ip]["socket"].send(data)
-        except:
-            self.peers[ip]["connected"] = False
-            self.root.after(0, self.update_users_list)
-    
-    def broadcast_message(self, message):
-        """Отправка сообщения всем подключенным пользователям"""
-        for ip in list(self.peers.keys()):
-            if self.peers[ip]["connected"]:
-                self.send_to_peer(ip, message)
-    
-    def send_message(self, event=None):
-        """Отправка сообщения"""
-        content = self.message_entry.get().strip()
-        if not content:
-            return
-            
-        self.message_entry.delete(0, tk.END)
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        if self.chat_type == 'group':
-            message = {
-                'type': 'message',
-                'chat_type': 'group',
-                'content': content,
-                'sender': self.username,
-                'timestamp': timestamp,
-                'target': self.current_chat
-            }
-            self.broadcast_message(message)
-            
-        elif self.chat_type == 'private':
-            message = {
-                'type': 'message', 
-                'chat_type': 'private',
-                'content': content,
-                'sender': self.username,
-                'timestamp': timestamp,
-                'target': self.current_chat
-            }
-            self.send_to_peer(self.current_chat, message)
-        
-        # Сохраняем и отображаем свое сообщение
-        self.save_message(self.username, content, timestamp, self.chat_type, self.current_chat)
-        self.display_message(self.username, content, timestamp)
-    
-    def display_message(self, sender, content, timestamp):
-        """Отображение сообщения в чате"""
-        self.chat_area.config(state=tk.NORMAL)
-        
-        if sender == self.username:
-            display_text = f"[{timestamp}] Вы: {content}\n"
-            tag = "own"
-        else:
-            display_text = f"[{timestamp}] {sender}: {content}\n"
-            tag = "other"
-        
-        self.chat_area.insert(tk.END, display_text, tag)
-        self.chat_area.config(state=tk.DISABLED)
-        self.chat_area.see(tk.END)
-    
-    def load_chat_history(self):
-        """Загрузка истории текущего чата"""
-        self.chat_area.config(state=tk.NORMAL)
-        self.chat_area.delete(1.0, tk.END)
-        
-        if self.chat_type == 'group':
-            if self.current_chat in self.chat_history["group"]:
-                for msg in self.chat_history["group"][self.current_chat]:
-                    sender_display = "Вы" if msg['sender'] == self.username else msg['sender']
-                    display_text = f"[{msg['timestamp']}] {sender_display}: {msg['content']}\n"
-                    tag = "own" if msg['sender'] == self.username else "other"
-                    self.chat_area.insert(tk.END, display_text, tag)
-        
-        elif self.chat_type == 'private':
-            if self.current_chat in self.chat_history["private"]:
-                for msg in self.chat_history["private"][self.current_chat]:
-                    sender_display = "Вы" if msg['sender'] == self.username else msg['sender']
-                    display_text = f"[{msg['timestamp']}] {sender_display}: {msg['content']}\n"
-                    tag = "own" if msg['sender'] == self.username else "other"
-                    self.chat_area.insert(tk.END, display_text, tag)
-        
-        self.chat_area.config(state=tk.DISABLED)
-        self.chat_area.see(tk.END)
-    
-    def on_group_select(self, event):
-        """Обработка выбора группового чата"""
-        selection = self.group_listbox.curselection()
-        if selection:
-            group_name = self.group_listbox.get(selection[0])
-            self.current_chat = group_name
-            self.chat_type = "group"
-            self.chat_header.config(text=f"Групповой чат: {group_name}")
-            self.load_chat_history()
-    
-    def on_user_select(self, event):
-        """Обработка выбора пользователя"""
+    def send_private_from_list(self):
+        """Отправка личного сообщения выбранному пользователю"""
         selection = self.users_listbox.curselection()
         if selection:
-            user_info = self.users_listbox.get(selection[0])
-            if "(Вы)" not in user_info:
-                ip = user_info.split(" ")[0]  # Извлекаем IP из строки
-                self.current_chat = ip
-                self.chat_type = "private"
-                self.chat_header.config(text=f"Приватный чат с {ip}")
+            target_ip = self.users_listbox.get(selection[0])
+            self.message_type.set("private")
+            self.message_entry.focus()
+            self.status_var.set(f"Режим личного сообщения для {target_ip}")
+        
+    def send_message(self):
+        """Отправка сообщения"""
+        message = self.message_entry.get().strip()
+        if not message:
+            return
+            
+        message_type = self.message_type.get()
+        
+        if message_type == "group":
+            self.send_group_message(message)
+            self.add_message_to_chat(f"Вы (группа): {message}", "own_group")
+        else:
+            selection = self.users_listbox.curselection()
+            if selection:
+                target_ip = self.users_listbox.get(selection[0])
+                if target_ip != self.username:
+                    self.send_private_message(target_ip, message)
+                    self.add_message_to_chat(f"Вы -> {target_ip}: {message}", "own_private")
+                else:
+                    messagebox.showwarning("Предупреждение", "Нельзя отправить сообщение самому себе")
+            else:
+                messagebox.showwarning("Предупреждение", "Выберите пользователя для личного сообщения")
+                return
                 
-                if ip not in self.chat_history["private"]:
-                    self.chat_history["private"][ip] = []
+        self.message_entry.delete(0, tk.END)
+        
+    def send_group_message(self, message):
+        """Отправка сообщения в групповой чат"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        data = {
+            'type': 'group_message',
+            'username': self.username,
+            'message': message,
+            'timestamp': timestamp
+        }
+        
+        try:
+            json_data = json.dumps(data).encode('utf-8')
+            self.multicast_socket.sendto(json_data, (self.multicast_group, self.multicast_port))
+        except Exception as e:
+            self.status_var.set(f"Ошибка отправки: {e}")
+            
+    def send_private_message(self, target_ip, message):
+        """Отправка личного сообщения"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect((target_ip, self.tcp_port))
                 
-                self.load_chat_history()
-    
+                data = {
+                    'type': 'private_message',
+                    'from': self.username,
+                    'message': message,
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                }
+                
+                json_data = json.dumps(data).encode('utf-8')
+                sock.send(json_data)
+                self.status_var.set(f"Личное сообщение отправлено {target_ip}")
+                
+        except Exception as e:
+            self.status_var.set(f"Ошибка отправки: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось отправить сообщение {target_ip}: {e}")
+            
+    def handle_private_connection(self, client_socket, address):
+        """Обработка входящих личных сообщений"""
+        try:
+            data = client_socket.recv(1024).decode('utf-8')
+            if data:
+                message_data = json.loads(data)
+                if message_data['type'] == 'private_message':
+                    self.add_message_to_chat(
+                        f"{message_data['from']} (личное): {message_data['message']}", 
+                        "private"
+                    )
+                    self.status_var.set(f"Новое личное сообщение от {message_data['from']}")
+                    
+        except Exception as e:
+            print(f"Ошибка при обработке личного сообщения: {e}")
+        finally:
+            client_socket.close()
+            
+    def listen_private_messages(self):
+        """Прослушивание входящих личных сообщений"""
+        while self.running:
+            try:
+                client_socket, address = self.tcp_socket.accept()
+                thread = threading.Thread(target=self.handle_private_connection, args=(client_socket, address))
+                thread.daemon = True
+                thread.start()
+            except:
+                pass
+                
+    def listen_group_messages(self):
+        """Прослушивание групповых сообщений"""
+        while self.running:
+            try:
+                data, address = self.udp_socket.recvfrom(1024)
+                message_data = json.loads(data.decode('utf-8'))
+                
+                if message_data['type'] == 'group_message':
+                    # Обновляем список известных пользователей
+                    if address[0] != self.username:
+                        self.known_users[address[0]] = time.time()
+                        self.update_users_list()
+                    
+                    self.add_message_to_chat(
+                        f"{message_data['username']}: {message_data['message']}", 
+                        "group"
+                    )
+                    
+                elif message_data['type'] == 'user_online':
+                    if address[0] != self.username:
+                        self.known_users[address[0]] = time.time()
+                        self.update_users_list()
+                        self.add_system_message(f"Пользователь {address[0]} в сети")
+                        
+            except Exception as e:
+                print(f"Ошибка приема: {e}")
+                
+    def add_message_to_chat(self, message, message_type):
+        """Добавление сообщения в чат"""
+        self.chat_text.config(state=tk.NORMAL)
+        
+        # Цвета для разных типов сообщений
+        colors = {
+            "group": "black",
+            "private": "blue",
+            "own_group": "darkgreen",
+            "own_private": "purple",
+            "system": "gray"
+        }
+        
+        self.chat_text.insert(tk.END, message + "\n", message_type)
+        self.chat_text.see(tk.END)
+        self.chat_text.config(state=tk.DISABLED)
+        
+    def add_system_message(self, message):
+        """Добавление системного сообщения"""
+        self.add_message_to_chat(f"[Система] {message}", "system")
+        
+    def broadcast_online(self):
+        """Рассылка информации о том, что пользователь онлайн"""
+        data = {
+            'type': 'user_online',
+            'username': self.username
+        }
+        try:
+            json_data = json.dumps(data).encode('utf-8')
+            self.multicast_socket.sendto(json_data, (self.multicast_group, self.multicast_port))
+            self.status_var.set("Отправлен онлайн-статус")
+        except Exception as e:
+            self.status_var.set(f"Ошибка отправки онлайн-статуса: {e}")
+            
     def update_users_list(self):
         """Обновление списка пользователей"""
         self.users_listbox.delete(0, tk.END)
+        self.users_listbox.insert(tk.END, self.username + " (Вы)")
         
-        # Добавляем себя
-        self.users_listbox.insert(tk.END, f"{self.username} (Вы)")
+        for user_ip in sorted(self.known_users.keys()):
+            self.users_listbox.insert(tk.END, user_ip)
+            
+    def cleanup_old_users(self):
+        """Очистка старых пользователей"""
+        while self.running:
+            time.sleep(30)
+            current_time = time.time()
+            offline_users = []
+            
+            for user_ip, last_seen in self.known_users.items():
+                if current_time - last_seen > 60:  # 60 секунд без активности
+                    offline_users.append(user_ip)
+                    
+            for user_ip in offline_users:
+                del self.known_users[user_ip]
+                self.update_users_list()
+                self.add_system_message(f"Пользователь {user_ip} отключился")
+                
+    def start_listeners(self):
+        """Запуск потоков прослушивания"""
+        # Поток для групповых сообщений
+        group_thread = threading.Thread(target=self.listen_group_messages)
+        group_thread.daemon = True
+        group_thread.start()
         
-        # Добавляем подключенных пользователей
-        for ip, info in self.peers.items():
-            if info.get("connected"):
-                status = "✓" if info["connected"] else "✗"
-                self.users_listbox.insert(tk.END, f"{ip} {status}")
+        # Поток для личных сообщений
+        private_thread = threading.Thread(target=self.listen_private_messages)
+        private_thread.daemon = True
+        private_thread.start()
         
-        self.update_status(f"Пользователей: {len([p for p in self.peers.values() if p.get('connected')])}")
+        # Поток для очистки старых пользователей
+        cleanup_thread = threading.Thread(target=self.cleanup_old_users)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        
+    def on_closing(self):
+        """Действия при закрытии окна"""
+        self.running = False
+        try:
+            self.udp_socket.close()
+            self.multicast_socket.close()
+            self.tcp_socket.close()
+        except:
+            pass
+        self.root.destroy()
+
+def main():
+    root = tk.Tk()
+    app = P2PChatGUI(root)
     
-    def manual_discovery(self):
-        """Ручное обновление списка пользователей"""
-        threading.Thread(target=self.network_discovery, daemon=True).start()
-        self.update_status("Поиск пользователей...")
+    # Обработка закрытия окна
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
-    def update_status(self, message):
-        """Обновление статуса"""
-        def update():
-            self.status_var.set(message)
-        self.root.after(0, update)
+    # Настройка тегов для цветов сообщений
+    app.chat_text.tag_config("group", foreground="black")
+    app.chat_text.tag_config("private", foreground="blue")
+    app.chat_text.tag_config("own_group", foreground="darkgreen")
+    app.chat_text.tag_config("own_private", foreground="purple")
+    app.chat_text.tag_config("system", foreground="gray")
     
-    def run(self):
-        """Запуск приложения"""
-        # Настраиваем цвета сообщений
-        self.chat_area.tag_config("own", foreground="blue")
-        self.chat_area.tag_config("other", foreground="green")
-        
-        # Загружаем историю начального чата
-        self.load_chat_history()
-        
-        self.root.mainloop()
+    root.mainloop()
 
 if __name__ == "__main__":
-    print("Запуск мессенджера...")
-    print("Для подключения других пользователей:")
-    print("1. Запустите программу на других компьютерах в той же сети")
-    print("2. Или используйте кнопку 'Добавить IP' для ручного ввода")
-    app = P2PMessenger()
-    app.run()
+    main()
