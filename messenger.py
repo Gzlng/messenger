@@ -21,26 +21,33 @@ class P2PChatGUI:
         self.multicast_port = 5007
         self.multicast_ttl = 1
         self.tcp_port = 5008
-        self.known_users = {}
+        self.known_users = {}  # ip -> {'last_seen': timestamp, 'status': 'online'}
+        
+        # Улучшенные настройки таймаутов
+        self.HEARTBEAT_INTERVAL = 25  # секунд между heartbeat
+        self.USER_TIMEOUT = 60  # секунд до отметки как offline
+        self.CLEANUP_INTERVAL = 30  # секунд между очистками
         
         self.setup_sockets()
         self.create_widgets()
         self.start_listeners()
         
-        # Уведомляем о своем присутствии
-        self.broadcast_online()
+        # Запуск heartbeat
+        self.start_heartbeat()
         
     def setup_sockets(self):
-        """Инициализация сокетов"""
+        """Инициализация сокетов с улучшенной обработкой ошибок"""
         try:
             # Multicast сокет для группового чата
             self.multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.multicast_ttl)
+            self.multicast_socket.settimeout(0.5)  # Таймаут для неблокирующей работы
             
             # UDP сокет для приема multicast
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.udp_socket.bind(('', self.multicast_port))
+            self.udp_socket.settimeout(0.5)  # Таймаут для неблокирующей работы
             
             # Подписка на multicast группу
             group = socket.inet_aton(self.multicast_group)
@@ -50,6 +57,7 @@ class P2PChatGUI:
             # TCP сокет для личных сообщений
             self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.tcp_socket.settimeout(0.5)  # Таймаут для accept
             self.tcp_socket.bind(('0.0.0.0', self.tcp_port))
             self.tcp_socket.listen(5)
             
@@ -148,11 +156,31 @@ class P2PChatGUI:
         # Обновление списка пользователей
         self.update_users_list()
         
+    def send_heartbeat(self):
+        """Регулярная отправка heartbeat для поддержания соединения"""
+        while self.running:
+            try:
+                self.broadcast_online()
+                time.sleep(self.HEARTBEAT_INTERVAL)
+            except Exception as e:
+                print(f"Ошибка heartbeat: {e}")
+                
+    def start_heartbeat(self):
+        """Запуск потока heartbeat"""
+        heartbeat_thread = threading.Thread(target=self.send_heartbeat)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+        
     def send_private_from_list(self):
         """Отправка личного сообщения выбранному пользователю"""
         selection = self.users_listbox.curselection()
         if selection:
-            target_ip = self.users_listbox.get(selection[0])
+            user_data = self.users_listbox.get(selection[0])
+            if "(Вы)" in user_data:
+                messagebox.showwarning("Предупреждение", "Нельзя отправить сообщение самому себе")
+                return
+                
+            target_ip = user_data.split(" ")[0]  # Извлекаем IP из строки
             self.message_type.set("private")
             self.message_entry.focus()
             self.status_var.set(f"Режим личного сообщения для {target_ip}")
@@ -171,12 +199,14 @@ class P2PChatGUI:
         else:
             selection = self.users_listbox.curselection()
             if selection:
-                target_ip = self.users_listbox.get(selection[0])
-                if target_ip != self.username:
+                user_data = self.users_listbox.get(selection[0])
+                if "(Вы)" not in user_data:
+                    target_ip = user_data.split(" ")[0]
                     self.send_private_message(target_ip, message)
                     self.add_message_to_chat(f"Вы -> {target_ip}: {message}", "own_private")
                 else:
                     messagebox.showwarning("Предупреждение", "Нельзя отправить сообщение самому себе")
+                    return
             else:
                 messagebox.showwarning("Предупреждение", "Выберите пользователя для личного сообщения")
                 return
@@ -240,18 +270,22 @@ class P2PChatGUI:
             client_socket.close()
             
     def listen_private_messages(self):
-        """Прослушивание входящих личных сообщений"""
+        """Прослушивание входящих личных сообщений с улучшенной стабильностью"""
         while self.running:
             try:
                 client_socket, address = self.tcp_socket.accept()
                 thread = threading.Thread(target=self.handle_private_connection, args=(client_socket, address))
                 thread.daemon = True
                 thread.start()
-            except:
-                pass
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:  # Только если не завершаем работу
+                    print(f"Ошибка accept: {e}")
+                time.sleep(1)
                 
     def listen_group_messages(self):
-        """Прослушивание групповых сообщений"""
+        """Прослушивание групповых сообщений с улучшенной стабильностью"""
         while self.running:
             try:
                 data, address = self.udp_socket.recvfrom(1024)
@@ -260,8 +294,7 @@ class P2PChatGUI:
                 if message_data['type'] == 'group_message':
                     # Обновляем список известных пользователей
                     if address[0] != self.username:
-                        self.known_users[address[0]] = time.time()
-                        self.update_users_list()
+                        self.update_user_status(address[0], 'online')
                     
                     self.add_message_to_chat(
                         f"{message_data['username']}: {message_data['message']}", 
@@ -270,27 +303,36 @@ class P2PChatGUI:
                     
                 elif message_data['type'] == 'user_online':
                     if address[0] != self.username:
-                        self.known_users[address[0]] = time.time()
-                        self.update_users_list()
-                        self.add_system_message(f"Пользователь {address[0]} в сети")
+                        was_online = address[0] in self.known_users
+                        self.update_user_status(address[0], 'online')
                         
+                        if not was_online:
+                            self.add_system_message(f"Пользователь {address[0]} в сети")
+                        
+            except socket.timeout:
+                continue
             except Exception as e:
-                print(f"Ошибка приема: {e}")
-                
+                if self.running:  # Только если не завершаем работу
+                    print(f"Ошибка приема multicast: {e}")
+                    
+    def update_user_status(self, user_ip, status):
+        """Обновление статуса пользователя"""
+        current_time = time.time()
+        self.known_users[user_ip] = {
+            'last_seen': current_time,
+            'status': status
+        }
+        self.update_users_list()
+        
     def add_message_to_chat(self, message, message_type):
         """Добавление сообщения в чат"""
         self.chat_text.config(state=tk.NORMAL)
         
-        # Цвета для разных типов сообщений
-        colors = {
-            "group": "black",
-            "private": "blue",
-            "own_group": "darkgreen",
-            "own_private": "purple",
-            "system": "gray"
-        }
+        # Добавляем временную метку
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] {message}"
         
-        self.chat_text.insert(tk.END, message + "\n", message_type)
+        self.chat_text.insert(tk.END, formatted_message + "\n", message_type)
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)
         
@@ -307,33 +349,44 @@ class P2PChatGUI:
         try:
             json_data = json.dumps(data).encode('utf-8')
             self.multicast_socket.sendto(json_data, (self.multicast_group, self.multicast_port))
-            self.status_var.set("Отправлен онлайн-статус")
         except Exception as e:
             self.status_var.set(f"Ошибка отправки онлайн-статуса: {e}")
             
     def update_users_list(self):
         """Обновление списка пользователей"""
         self.users_listbox.delete(0, tk.END)
-        self.users_listbox.insert(tk.END, self.username + " (Вы)")
+        self.users_listbox.insert(tk.END, f"{self.username} (Вы)")
         
-        for user_ip in sorted(self.known_users.keys()):
-            self.users_listbox.insert(tk.END, user_ip)
+        current_time = time.time()
+        online_users = []
+        
+        for user_ip, user_data in self.known_users.items():
+            if current_time - user_data['last_seen'] <= self.USER_TIMEOUT:
+                online_users.append(user_ip)
+            else:
+                # Помечаем как отключившегося
+                if user_data['status'] == 'online':
+                    self.known_users[user_ip]['status'] = 'offline'
+                    self.add_system_message(f"Пользователь {user_ip} отключился")
+        
+        # Сортируем и добавляем онлайн пользователей
+        for user_ip in sorted(online_users):
+            self.users_listbox.insert(tk.END, f"{user_ip}")
             
     def cleanup_old_users(self):
-        """Очистка старых пользователей"""
+        """Очистка старых пользователей с улучшенной логикой"""
         while self.running:
-            time.sleep(30)
+            time.sleep(self.CLEANUP_INTERVAL)
             current_time = time.time()
-            offline_users = []
+            users_to_remove = []
             
-            for user_ip, last_seen in self.known_users.items():
-                if current_time - last_seen > 60:  # 60 секунд без активности
-                    offline_users.append(user_ip)
+            for user_ip, user_data in self.known_users.items():
+                if current_time - user_data['last_seen'] > self.USER_TIMEOUT * 2:  # Удаляем через 2 таймаута
+                    users_to_remove.append(user_ip)
                     
-            for user_ip in offline_users:
+            for user_ip in users_to_remove:
                 del self.known_users[user_ip]
                 self.update_users_list()
-                self.add_system_message(f"Пользователь {user_ip} отключился")
                 
     def start_listeners(self):
         """Запуск потоков прослушивания"""
@@ -355,6 +408,8 @@ class P2PChatGUI:
     def on_closing(self):
         """Действия при закрытии окна"""
         self.running = False
+        time.sleep(0.5)  # Даем время потокам завершиться
+        
         try:
             self.udp_socket.close()
             self.multicast_socket.close()
