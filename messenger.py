@@ -195,7 +195,6 @@ class P2PChatGUI:
         
         if message_type == "group":
             self.send_group_message(message)
-            self.add_message_to_chat(f"Вы (группа): {message}", "own_group")
         else:
             selection = self.users_listbox.curselection()
             if selection:
