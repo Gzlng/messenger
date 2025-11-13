@@ -46,7 +46,7 @@ def translate_text(text, src, tgt):
     result = tokenizer.decode(translated[0], skip_special_tokens=True)
     return result
 
-
+# тест
 def setup_sockets():
         global multicast_socket
         global multicast_group
